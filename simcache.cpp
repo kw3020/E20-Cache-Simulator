@@ -15,6 +15,7 @@ simcache.cpp
 #include <list>
 #include <algorithm>
 #include <regex>
+#include <cmath>
 
 using namespace std;
 
@@ -108,37 +109,52 @@ public:
         }
     }
 
+    int getNumRows() { return numRows; }
+
     // Function to access cache and update LRU
     pair<bool, int> accessCache(int address, int& data, bool isWrite) {
-        int rowIndex = (address / blocksize) % numRows;
-        int tag = (address / blocksize) / numRows;
+        int offsetBits = log2(blocksize);
+        int indexBits = log2(numRows);
+        int index = (address >> offsetBits) & ((1 << indexBits) - 1);
+        int tag = address >> (offsetBits + indexBits);
         bool hit = false;
 
-        for (auto &block : rows[rowIndex]) {
-            if (block.valid && block.tag == tag) {
-                block.lastUsed = ++lruCounter;
+        // Search for tag in the cache row
+        for (int i = 0; i < associativity; ++i) {
+            if (rows[index][i].valid && rows[index][i].tag == tag) {
                 if (isWrite) {
-                    block.data = data; // Write-through
+                    rows[index][i].data = data;
                 } else {
-                    data = block.data; // Read
+                    data = rows[index][i].data;
                 }
+                rows[index][i].lastUsed = ++lruCounter;
                 hit = true;
-                break; // Found in cache, no need to check further
+                return {hit, index};
             }
         }
 
-        if (!hit && !isWrite) {
-            // For read misses, data must be fetched from lower memory level
-            data = -1; // Default value for fetched data
+        if (!hit) {
+            // Handle cache miss
+            int lruIndex = findLRUBlockIndex(index);
+            rows[index][lruIndex].valid = true;
+            rows[index][lruIndex].tag = tag;
+            rows[index][lruIndex].lastUsed = ++lruCounter;
+
+            if (isWrite) {
+                rows[index][lruIndex].data = data;
+            } else {
+                data = -1; // Assume default value for fetched data
+            }
+            return {hit, index};
         }
 
-        return {hit, rowIndex};
+        return {hit, index};
     }
 
     // Function to write data to cache (write-through)
-    void writeThrough(int address, int data) {
-        int dummyData;
-        accessCache(address, dummyData, true);
+    void writeThrough(int address, int data, int& rowIndex) {
+        auto result = accessCache(address, data, true);
+        rowIndex = result.second;
     }
 
     // Utility function to display cache configuration
@@ -269,9 +285,11 @@ void slti(uint16_t regDst, uint16_t regSrc, uint16_t imm, uint16_t regs[]) {
         regs[regDst] = (static_cast<int32_t>(regs[regSrc]) < signedImm) ? 1 : 0;
 }
 //3.2.2 lw $regDst, imm($regAddr)
+
 void lw(uint16_t regDst, uint16_t regAddr, uint16_t imm, uint16_t memory[], uint16_t regs[], Cache &L1Cache, Cache *L2Cache, unsigned pc) {
     uint16_t effectiveAddress = (regs[regAddr] + imm) % MEM_SIZE;
     int data;
+    int rowIndex, blockIndex;
     auto result = L1Cache.accessCache(effectiveAddress, data, false); // Read operation
 
     if (result.first) { // L1 Cache hit
@@ -281,25 +299,31 @@ void lw(uint16_t regDst, uint16_t regAddr, uint16_t imm, uint16_t memory[], uint
         if (L2Cache) { // Check L2 cache if it exists
             auto L2Result = L2Cache->accessCache(effectiveAddress, data, false);
             if (L2Result.first) {
+                regs[regDst] = data;
                 print_log_entry("L2", "HIT", pc, effectiveAddress, L2Result.second);
             } else {
+                regs[regDst] = memory[effectiveAddress]; // Load from memory
                 print_log_entry("L2", "MISS", pc, effectiveAddress, L2Result.second);
+                L2Cache->writeThrough(effectiveAddress, regs[regDst], rowIndex); // Update L2 cache
+                print_log_entry("L2", "SW", pc, effectiveAddress, rowIndex);
             }
+        } else {
+            regs[regDst] = memory[effectiveAddress]; // Load from memory
         }
-        regs[regDst] = memory[effectiveAddress]; // Load from memory
-        L1Cache.writeThrough(effectiveAddress, regs[regDst]); // Update L1 cache
-        print_log_entry("L1", "MISS", pc, effectiveAddress, result.second);
+        L1Cache.writeThrough(effectiveAddress, regs[regDst], rowIndex); // Update L1 cache
+        print_log_entry("L1", "MISS", pc, effectiveAddress, rowIndex);
     }
 }
 //3.2.3 sw $regSrc, imm($regAddr)
 void sw(uint16_t regSrc, uint16_t regAddr, uint16_t imm, uint16_t memory[], uint16_t regs[], Cache &L1Cache, Cache *L2Cache, unsigned pc) {
     uint16_t effectiveAddress = (regs[regAddr] + imm) % MEM_SIZE;
+    int rowIndex, blockIndex;
     memory[effectiveAddress] = regs[regSrc]; // Store to memory first
-    L1Cache.writeThrough(effectiveAddress, regs[regSrc]); // Update L1 cache
-    print_log_entry("L1", "SW", pc, effectiveAddress, -1); // -1 for row as writeThrough doesn't return row
+    L1Cache.writeThrough(effectiveAddress, regs[regSrc], rowIndex); // Update L1 cache
+    print_log_entry("L1", "SW", pc, effectiveAddress, rowIndex);
     if (L2Cache) {
-        L2Cache->writeThrough(effectiveAddress, regs[regSrc]); // Update L2 cache if it exists
-        print_log_entry("L2", "SW", pc, effectiveAddress, -1); // -1 for row
+        L2Cache->writeThrough(effectiveAddress, regs[regSrc], rowIndex); // Update L2 cache if it exists
+        print_log_entry("L2", "SW", pc, effectiveAddress, rowIndex);
     }
 }
 //3.2.4 jeq $regA, $regB, imm
@@ -471,6 +495,7 @@ int main(int argc, char *argv[]) {
             int L1blocksize = parts[2];
             // TODO: execute E20 program and simulate one cache here
             L1Cache = Cache(L1size, L1assoc, L1blocksize);
+            print_cache_config("L1", L1size, L1assoc, L1blocksize, L1Cache.getNumRows());
         } else if (parts.size() == 6) {
             int L1size = parts[0];
             int L1assoc = parts[1];
@@ -481,11 +506,15 @@ int main(int argc, char *argv[]) {
             // TODO: execute E20 program and simulate two caches here
             L1Cache = Cache(L1size, L1assoc, L1blocksize);
             L2Cache = Cache(L2size, L2assoc, L2blocksize);
+            L2CachePtr = &L2Cache; // Update the pointer
+            print_cache_config("L1", L1size, L1assoc, L1blocksize, L1Cache.getNumRows());
+            print_cache_config("L2", L2size, L2assoc, L2blocksize, L2Cache.getNumRows());
         } else {
             cerr << "Invalid cache config"  << endl;
             return 1;
         }
     }
+
     unsigned pc = 0;
     bool running = true;
     while (running) {
